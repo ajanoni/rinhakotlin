@@ -18,9 +18,14 @@ repositories {
 dependencies {
     implementation(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
     implementation("io.vertx:vertx-core")
+    implementation("io.netty:netty-transport-classes-epoll")
     runtimeOnly("io.netty:netty-transport-native-epoll") {
         artifact { classifier = "linux-x86_64" }
     }
+
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 application {

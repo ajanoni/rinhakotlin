@@ -9,7 +9,7 @@ fun main() {
 
     val sockPath = System.getenv("SOCK") ?: "/run/sock/api.sock"
 
-    val options = VertxOptions().setEventLoopPoolSize(4)
+    val options = VertxOptions().setEventLoopPoolSize(4).setPreferNativeTransport(true)
     val vertx = Vertx.vertx(options)
     startHttpServer(vertx, sockPath)
 }

@@ -102,7 +102,8 @@ fun startHttpServer(vertx: Vertx, sockPath: String) {
             println("Listening on $sockPath")
         }
         .onFailure { err ->
-            System.err.println("Server failed to start: ${err.message}")
+            System.err.println("Server failed to start: $err")
+            err.printStackTrace()
             System.exit(1)
         }
 }
