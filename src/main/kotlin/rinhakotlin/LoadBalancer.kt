@@ -34,20 +34,16 @@ private fun connectWithFallback(
     remaining: Int,
 ) {
     if (remaining == 0) {
-        System.err.println("LB: all backends failed, returning 500")
         frontend.write(Buffer.buffer(SERVICE_UNAVAILABLE))
         frontend.close()
         return
     }
     val addr = backends[startIdx % backends.size]
-    System.err.println("LB: trying $addr (remaining=$remaining)")
     client.connect(SocketAddress.domainSocketAddress(addr)) { res ->
         if (res.failed()) {
-            System.err.println("LB: $addr failed: ${res.cause()?.message}")
             connectWithFallback(client, frontend, backends, startIdx + 1, remaining - 1)
             return@connect
         }
-        System.err.println("LB: $addr connected")
         val backend = res.result()
         frontend.handler { buf -> backend.write(buf) }
         backend.handler { buf -> frontend.write(buf) }
