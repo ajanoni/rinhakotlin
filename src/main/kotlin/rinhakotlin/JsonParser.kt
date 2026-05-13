@@ -25,8 +25,9 @@ private const val B_DOT = '.'.code.toByte()
 //  "terminal":{"is_online":B,"card_present":B,"km_from_home":F},
 //  "last_transaction":null|{"timestamp":"ISO","km_from_current":F}}
 
-fun parsePayload(buf: ByteArray, len: Int): Payload? {
-    val p = IntArray(1)
+fun parsePayload(buf: ByteArray, start: Int, end: Int): Payload? {
+    val len = end
+    val p = IntArray(1) { start }
 
     toNextValue(p, buf, len) || return null  // → transaction id value
     skipString(p, buf, len)   || return null  // skip id

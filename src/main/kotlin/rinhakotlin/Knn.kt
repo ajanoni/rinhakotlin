@@ -4,26 +4,56 @@ import jdk.incubator.vector.FloatVector
 import jdk.incubator.vector.IntVector
 import jdk.incubator.vector.ShortVector
 import jdk.incubator.vector.VectorOperators
-import java.nio.ByteBuffer
+import java.lang.foreign.MemorySegment
+import java.nio.ByteOrder
 
-private const val FAST_NPROBE = 8
-private const val FULL_NPROBE = 24
 private const val VECTOR_SCALE = 0.0001f
 
 private val F256 = FloatVector.SPECIES_256
 private val S128 = ShortVector.SPECIES_128
 private val I256 = IntVector.SPECIES_256
 
+private class KnnState(k: Int) {
+    val dists    = FloatArray(k)
+    val qvecs    = arrayOfNulls<FloatVector>(14)
+    val topDist  = FloatArray(5)
+    val topLabel = ByteArray(5)
+    val worstIdx = IntArray(1)
+    val distBuf  = FloatArray(8)
+}
+
+private val tlState = ThreadLocal.withInitial { KnnState(4096) }
+
 fun knn5FraudCount(query: FloatArray, ds: Dataset): Int {
-    val dists = FloatArray(ds.k)
-    computeCentroidDists(query, ds.centroids, ds.k, dists)
+    val s = tlState.get().also { st ->
+        if (st.dists.size != ds.k) tlState.set(KnnState(ds.k))
+    }.let { if (it.dists.size != ds.k) tlState.get() else it }
 
-    val fastProbes = topN(dists, ds.k, FAST_NPROBE)
-    val fast = scanAndCount(fastProbes, FAST_NPROBE, ds, query)
-    if (fast != 2 && fast != 3) return fast
+    computeCentroidDists(query, ds.centroids, ds.k, s.dists)
+    val best0 = findMin(s.dists, ds.k)
 
-    val fullProbes = topN(dists, ds.k, FULL_NPROBE)
-    return scanAndCount(fullProbes, FULL_NPROBE, ds, query)
+    for (d in 0..13) s.qvecs[d] = FloatVector.broadcast(F256, query[d])
+    @Suppress("UNCHECKED_CAST")
+    val qvecs = s.qvecs as Array<FloatVector>
+
+    s.topDist.fill(Float.POSITIVE_INFINITY)
+    s.topLabel.fill(0)
+    s.worstIdx[0] = 0
+
+    scanBlocks(qvecs, ds.blocksSeg, ds.labels, ds.offsets[best0], ds.offsets[best0 + 1],
+        s.topDist, s.topLabel, s.worstIdx, s.distBuf)
+
+    val initial = fraudCount(s.topLabel)
+    if (initial < 2 || initial > 3) return initial
+
+    for (ci in 0 until ds.k) {
+        if (ci == best0) continue
+        if (bboxLowerBound(query, ds.bboxMin, ds.bboxMax, ci) >= s.topDist[s.worstIdx[0]]) continue
+        scanBlocks(qvecs, ds.blocksSeg, ds.labels, ds.offsets[ci], ds.offsets[ci + 1],
+            s.topDist, s.topLabel, s.worstIdx, s.distBuf)
+    }
+
+    return fraudCount(s.topLabel)
 }
 
 fun warmup(ds: Dataset) {
@@ -38,98 +68,84 @@ fun warmup(ds: Dataset) {
     }
 }
 
-private fun computeCentroidDists(query: FloatArray, centroids: FloatArray, k: Int, dists: FloatArray) {
-    // dim 0: write (not accumulate)
+private fun fraudCount(topLabel: ByteArray): Int {
+    var n = 0
+    for (l in topLabel) if (l == 1.toByte()) n++
+    return n
+}
+
+private fun findMin(dists: FloatArray, k: Int): Int {
+    var best = 0; var bestD = dists[0]
+    for (i in 1 until k) if (dists[i] < bestD) { bestD = dists[i]; best = i }
+    return best
+}
+
+private fun computeCentroidDists(query: FloatArray, centroids: ShortArray, k: Int, dists: FloatArray) {
     val qd0 = FloatVector.broadcast(F256, query[0])
     var ci = 0
     while (ci + 8 <= k) {
-        val diff = FloatVector.fromArray(F256, centroids, ci).sub(qd0)
+        val sv = ShortVector.fromArray(S128, centroids, ci)
+        val fv = (sv.convertShape(VectorOperators.S2I, I256, 0) as IntVector)
+            .convert(VectorOperators.I2F, 0) as FloatVector
+        val diff = fv.mul(VECTOR_SCALE).sub(qd0)
         diff.mul(diff).intoArray(dists, ci)
         ci += 8
     }
-    while (ci < k) { val d = centroids[ci] - query[0]; dists[ci] = d * d; ci++ }
+    while (ci < k) { val d = centroids[ci] * VECTOR_SCALE - query[0]; dists[ci] = d * d; ci++ }
 
-    // dims 1-13: accumulate with fma
     for (dim in 1..13) {
         val base = dim * k
         val qd = FloatVector.broadcast(F256, query[dim])
         ci = 0
         while (ci + 8 <= k) {
-            val diff = FloatVector.fromArray(F256, centroids, base + ci).sub(qd)
+            val sv = ShortVector.fromArray(S128, centroids, base + ci)
+            val fv = (sv.convertShape(VectorOperators.S2I, I256, 0) as IntVector)
+                .convert(VectorOperators.I2F, 0) as FloatVector
+            val diff = fv.mul(VECTOR_SCALE).sub(qd)
             val acc = FloatVector.fromArray(F256, dists, ci)
             diff.fma(diff, acc).intoArray(dists, ci)
             ci += 8
         }
-        while (ci < k) { val d = centroids[base + ci] - query[dim]; dists[ci] += d * d; ci++ }
+        while (ci < k) { val d = centroids[base + ci] * VECTOR_SCALE - query[dim]; dists[ci] += d * d; ci++ }
     }
 }
 
-private fun topN(dists: FloatArray, k: Int, n: Int): IntArray {
-    val topDists = FloatArray(n) { Float.POSITIVE_INFINITY }
-    val topIdx = IntArray(n)
-    for (ci in 0 until k) {
-        val di = dists[ci]
-        if (di < topDists[n - 1]) {
-            var lo = 0; var hi = n
-            while (lo < hi) {
-                val mid = (lo + hi) ushr 1
-                if (topDists[mid] < di) lo = mid + 1 else hi = mid
-            }
-            for (j in n - 1 downTo lo + 1) {
-                topDists[j] = topDists[j - 1]; topIdx[j] = topIdx[j - 1]
-            }
-            topDists[lo] = di; topIdx[lo] = ci
-        }
+private fun bboxLowerBound(query: FloatArray, bboxMin: ShortArray, bboxMax: ShortArray, ci: Int): Float {
+    var s = 0f
+    val base = ci * 14
+    for (d in 0..13) {
+        val mn = bboxMin[base + d] * VECTOR_SCALE
+        val mx = bboxMax[base + d] * VECTOR_SCALE
+        val diff = if (query[d] < mn) mn - query[d] else if (query[d] > mx) query[d] - mx else 0f
+        s += diff * diff
     }
-    return topIdx
-}
-
-private fun scanAndCount(probes: IntArray, nProbes: Int, ds: Dataset, query: FloatArray): Int {
-    val qvecs = Array(14) { d -> FloatVector.broadcast(F256, query[d]) }
-    val topDist = FloatArray(5) { Float.POSITIVE_INFINITY }
-    val topLabel = ByteArray(5)
-    val worstIdxArr = IntArray(1)  // boxed by-ref worst index
-
-    for (pi in 0 until nProbes) {
-        val ci = probes[pi]
-        scanBlocks(qvecs, ds.blocks, ds.labels, ds.offsets[ci], ds.offsets[ci + 1],
-            topDist, topLabel, worstIdxArr)
-    }
-
-    var count = 0
-    for (l in topLabel) if (l == 1.toByte()) count++
-    return count
+    return s
 }
 
 @Suppress("UNCHECKED_CAST")
 private fun scanBlocks(
     qvecs: Array<FloatVector>,
-    blocks: ByteBuffer,
+    seg: MemorySegment,
     labels: ByteArray,
     startBlock: Int,
     endBlock: Int,
     topDist: FloatArray,
     topLabel: ByteArray,
     worstIdxArr: IntArray,
+    distBuf: FloatArray,
 ) {
-    val distBuf = FloatArray(8)
-    val tmpShorts = ShortArray(8)  // reused across all ld() calls within a block
-
     for (blockI in startBlock until endBlock) {
         val bb = blockI * 112
         val threshold = topDist[worstIdxArr[0]]
 
-        // load 8 i16 LE values from mmap'd ByteBuffer, dequantize, subtract query
         fun ld(dim: Int): FloatVector {
-            val byteOff = (bb + dim * 8) * 2
-            for (i in 0 until 8) tmpShorts[i] = blocks.getShort(byteOff + i * 2)
-            val sv = ShortVector.fromArray(S128, tmpShorts, 0)
+            val byteOff = ((bb + dim * 8) * 2).toLong()
+            val sv = ShortVector.fromMemorySegment(S128, seg, byteOff, ByteOrder.LITTLE_ENDIAN)
             val iv = sv.convertShape(VectorOperators.S2I, I256, 0) as IntVector
             val fv = iv.convert(VectorOperators.I2F, 0) as FloatVector
             return fv.mul(VECTOR_SCALE).sub(qvecs[dim])
         }
 
-        // First 8 dims — two-accumulator ILP pattern, early exit after partial sum
         val d0 = ld(0); var acc0 = d0.mul(d0)
         val d1 = ld(1); var acc1 = d1.mul(d1)
         val d2 = ld(2); acc0 = d2.fma(d2, acc0)
@@ -139,13 +155,11 @@ private fun scanBlocks(
         val d6 = ld(6); acc0 = d6.fma(d6, acc0)
         val d7 = ld(7); acc1 = d7.fma(d7, acc1)
 
-        // If no lane's partial distance < threshold, all 8 vectors can't enter top-5
         val partial = acc0.add(acc1)
         if (!partial.compare(VectorOperators.LT, threshold).anyTrue()) continue
 
-        // Remaining 6 dims
-        val d8 = ld(8); acc0 = d8.fma(d8, acc0)
-        val d9 = ld(9); acc1 = d9.fma(d9, acc1)
+        val d8  = ld(8);  acc0 = d8.fma(d8,   acc0)
+        val d9  = ld(9);  acc1 = d9.fma(d9,   acc1)
         val d10 = ld(10); acc0 = d10.fma(d10, acc0)
         val d11 = ld(11); acc1 = d11.fma(d11, acc1)
         val d12 = ld(12); acc0 = d12.fma(d12, acc0)
@@ -167,9 +181,7 @@ private fun scanBlocks(
                 topDist[wi] = di
                 topLabel[wi] = labels[labelBase + slot]
                 var maxDist = topDist[0]; var maxIdx = 0
-                for (j in 1..4) {
-                    if (topDist[j] > maxDist) { maxDist = topDist[j]; maxIdx = j }
-                }
+                for (j in 1..4) { if (topDist[j] > maxDist) { maxDist = topDist[j]; maxIdx = j } }
                 worstIdxArr[0] = maxIdx
             }
         }

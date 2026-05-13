@@ -1,9 +1,13 @@
 package rinhakotlin
 
-import io.vertx.core.Vertx
-import io.vertx.core.buffer.Buffer
-import io.vertx.core.net.NetServerOptions
-import io.vertx.core.net.SocketAddress
+import java.net.StandardProtocolFamily
+import java.net.UnixDomainSocketAddress
+import java.nio.ByteBuffer
+import java.nio.channels.ServerSocketChannel
+import java.nio.channels.SocketChannel
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.nio.file.attribute.PosixFilePermissions
 
 private const val RX_CAP = 8192
 
@@ -22,100 +26,76 @@ private sealed class Parsed {
     class Fraud(val bodyStart: Int, val bodyEnd: Int, val consumed: Int) : Parsed()
 }
 
-private class ConnState {
-    val rx = ByteArray(RX_CAP)
-    var head = 0
-    var tail = 0
-}
-
-fun startHttpServer(vertx: Vertx, sockPath: String) {
-    val opts = NetServerOptions().setTcpNoDelay(true)
-    val server = vertx.createNetServer(opts)
-
-    server.connectHandler { socket ->
-        val state = ConnState()
-
-        socket.handler { inBuf ->
-            val bytes = inBuf.bytes
-            val n = bytes.size
-            if (state.tail + n > RX_CAP) { socket.close(); return@handler }
-            bytes.copyInto(state.rx, state.tail)
-            state.tail += n
-
-            val out = Buffer.buffer()
-            var closeAfter = false
-
-            loop@ while (state.head < state.tail) {
-                when (val p = httpParse(state.rx, state.head, state.tail)) {
-                    Parsed.Incomplete -> break@loop
-                    Parsed.Bad -> {
-                        out.appendBytes(Response.BAD_REQUEST)
-                        closeAfter = true
-                        break@loop
-                    }
-                    is Parsed.Ready -> {
-                        out.appendBytes(Response.READY)
-                        state.head += p.consumed
-                    }
-                    is Parsed.NotFound -> {
-                        out.appendBytes(Response.NOT_FOUND)
-                        state.head += p.consumed
-                    }
-                    is Parsed.Fraud -> {
-                        val abs = state.head
-                        val body = state.rx.copyOfRange(abs + p.bodyStart, abs + p.bodyEnd)
-                        out.appendBytes(processFraud(body))
-                        state.head += p.consumed
-                    }
-                }
-            }
-
-            if (out.length() > 0) socket.write(out)
-            if (closeAfter) { socket.close(); return@handler }
-
-            // Compact rx buffer
-            when {
-                state.head == state.tail -> { state.head = 0; state.tail = 0 }
-                state.head > 0 -> {
-                    state.rx.copyInto(state.rx, 0, state.head, state.tail)
-                    state.tail -= state.head
-                    state.head = 0
-                }
-            }
-        }
-
-        socket.exceptionHandler { socket.close() }
-    }
-
+fun startHttpServer(sockPath: String) {
     val sockFile = java.io.File(sockPath)
     sockFile.parentFile?.mkdirs()
     sockFile.delete()
 
-    server.listen(SocketAddress.domainSocketAddress(sockPath))
-        .onSuccess {
-            runCatching {
-                java.nio.file.Files.setPosixFilePermissions(
-                    java.nio.file.Paths.get(sockPath),
-                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-rw-rw-"),
-                )
-            }
-            println("Listening on $sockPath")
-        }
-        .onFailure { err ->
-            System.err.println("Server failed to start: $err")
-            err.printStackTrace()
-            System.exit(1)
-        }
+    val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+    server.bind(UnixDomainSocketAddress.of(sockPath), 4096)
+
+    runCatching {
+        Files.setPosixFilePermissions(
+            Paths.get(sockPath),
+            PosixFilePermissions.fromString("rw-rw-rw-"),
+        )
+    }
+    println("Listening on $sockPath")
+
+    // One virtual thread per connection: blocking I/O, synchronous KNN — no thread pool overhead.
+    while (true) {
+        val client = server.accept()
+        Thread.ofVirtual().start { handleConnection(client) }
+    }
 }
 
-private fun processFraud(body: ByteArray): ByteArray {
-    val payload = parsePayload(body, body.size) ?: return Response.FALLBACK
+private fun writeAll(channel: SocketChannel, data: ByteArray) {
+    val buf = ByteBuffer.wrap(data)
+    while (buf.hasRemaining()) channel.write(buf)
+}
+
+private fun handleConnection(channel: SocketChannel) {
+    channel.use {
+        val buf = ByteArray(RX_CAP)
+        var tail = 0
+
+        while (true) {
+            val space = RX_CAP - tail
+            if (space == 0) { writeAll(it, Response.BAD_REQUEST); return }
+
+            val n = it.read(ByteBuffer.wrap(buf, tail, space))
+            if (n <= 0) return
+            tail += n
+
+            var head = 0
+            parse@ while (head < tail) {
+                when (val p = httpParse(buf, head, tail)) {
+                    Parsed.Incomplete -> break@parse
+                    Parsed.Bad -> { writeAll(it, Response.BAD_REQUEST); return }
+                    is Parsed.Ready -> { writeAll(it, Response.READY); head += p.consumed }
+                    is Parsed.NotFound -> { writeAll(it, Response.NOT_FOUND); head += p.consumed }
+                    is Parsed.Fraud -> {
+                        writeAll(it, processFraud(buf, head + p.bodyStart, head + p.bodyEnd))
+                        head += p.consumed
+                    }
+                }
+            }
+
+            when {
+                head == tail -> tail = 0
+                head > 0 -> { buf.copyInto(buf, 0, head, tail); tail -= head }
+            }
+        }
+    }
+}
+
+private fun processFraud(buf: ByteArray, start: Int, end: Int): ByteArray {
+    val payload = parsePayload(buf, start, end) ?: return Response.FALLBACK
     val query = vectorize(payload)
     val fraudCount = knn5FraudCount(query, DataLoader.dataset)
     return Response.forFraudCount(fraudCount)
 }
 
-// Returns absolute position of \r\n\r\n start, or null
 private fun findHeaderEnd(buf: ByteArray, start: Int, end: Int): Int? {
     val limit = end - 4
     var i = start
@@ -133,9 +113,8 @@ private fun pathEq(buf: ByteArray, start: Int, lineEnd: Int, path: ByteArray): B
     return next == ' '.code.toByte() || next == '?'.code.toByte()
 }
 
-// Case-insensitive search for "content-length:" in headers, returns the value
 private fun parseContentLength(buf: ByteArray, start: Int, end: Int): Int {
-    val N = CL_KEY.size  // 15
+    val N = CL_KEY.size
     val limit = end - N
     var i = start
     while (i <= limit) {
@@ -161,7 +140,6 @@ private fun parseContentLength(buf: ByteArray, start: Int, end: Int): Int {
     return 0
 }
 
-// All positions are absolute into buf. consumed/bodyStart/bodyEnd are relative to head.
 private fun httpParse(buf: ByteArray, head: Int, tail: Int): Parsed {
     if (tail - head < 16) return Parsed.Incomplete
 

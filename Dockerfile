@@ -16,13 +16,10 @@ FROM --platform=linux/amd64 eclipse-temurin:21-jre-jammy
 COPY --from=build /app/build/libs/rinhaKotlin-1.0-SNAPSHOT.jar /app.jar
 ENTRYPOINT ["java", \
   "--add-modules", "jdk.incubator.vector", \
-  "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED", \
-  "--add-opens", "java.base/java.nio=ALL-UNNAMED", \
   "-Xms64m", "-Xmx96m", \
   "-XX:+UseG1GC", \
   "-XX:MaxGCPauseMillis=5", \
   "-XX:G1HeapRegionSize=4m", \
   "-XX:MaxMetaspaceSize=28m", \
   "-XX:ReservedCodeCacheSize=16m", \
-  "-Dio.netty.maxDirectMemory=4194304", \
   "-jar", "/app.jar"]

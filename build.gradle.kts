@@ -9,20 +9,11 @@ plugins {
 group = "rinhakotlin"
 version = "1.0-SNAPSHOT"
 
-val vertxVersion = "4.5.10"
-
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    implementation(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
-    implementation("io.vertx:vertx-core")
-    implementation("io.netty:netty-transport-classes-epoll")
-    runtimeOnly("io.netty:netty-transport-native-epoll") {
-        artifact { classifier = "linux-x86_64" }
-    }
-
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -54,4 +45,12 @@ tasks.withType<ShadowJar> {
 tasks.test {
     useJUnitPlatform()
     jvmArgs("--add-modules", "jdk.incubator.vector")
+}
+
+tasks.register<JavaExec>("buildIndex") {
+    group = "application"
+    description = "Build IVF index from references.json.gz"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("rinhakotlin.BuildIndexKt")
+    jvmArgs("--add-modules", "jdk.incubator.vector", "-Xmx3g")
 }

@@ -43,3 +43,8 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Load test generated data ###
+load-test/references.json
+load-test/references.json.gz
+load-test/payloads.json
