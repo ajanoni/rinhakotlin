@@ -4,6 +4,7 @@ import jdk.incubator.vector.FloatVector
 import jdk.incubator.vector.IntVector
 import jdk.incubator.vector.ShortVector
 import jdk.incubator.vector.VectorOperators
+import java.nio.ByteBuffer
 
 private const val FAST_NPROBE = 8
 private const val FULL_NPROBE = 24
@@ -103,7 +104,7 @@ private fun scanAndCount(probes: IntArray, nProbes: Int, ds: Dataset, query: Flo
 @Suppress("UNCHECKED_CAST")
 private fun scanBlocks(
     qvecs: Array<FloatVector>,
-    blocks: ShortArray,
+    blocks: ByteBuffer,
     labels: ByteArray,
     startBlock: Int,
     endBlock: Int,
@@ -112,14 +113,17 @@ private fun scanBlocks(
     worstIdxArr: IntArray,
 ) {
     val distBuf = FloatArray(8)
+    val tmpShorts = ShortArray(8)  // reused across all ld() calls within a block
 
     for (blockI in startBlock until endBlock) {
         val bb = blockI * 112
         val threshold = topDist[worstIdxArr[0]]
 
-        // load 8 i16 values for dim, dequantize, subtract query
+        // load 8 i16 LE values from mmap'd ByteBuffer, dequantize, subtract query
         fun ld(dim: Int): FloatVector {
-            val sv = ShortVector.fromArray(S128, blocks, bb + dim * 8)
+            val byteOff = (bb + dim * 8) * 2
+            for (i in 0 until 8) tmpShorts[i] = blocks.getShort(byteOff + i * 2)
+            val sv = ShortVector.fromArray(S128, tmpShorts, 0)
             val iv = sv.convertShape(VectorOperators.S2I, I256, 0) as IntVector
             val fv = iv.convert(VectorOperators.I2F, 0) as FloatVector
             return fv.mul(VECTOR_SCALE).sub(qvecs[dim])

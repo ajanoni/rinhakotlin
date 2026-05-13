@@ -1,13 +1,15 @@
 package rinhakotlin
 
 import java.io.DataInputStream
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.util.zip.GZIPInputStream
 
 data class Dataset(
     val centroids: FloatArray,  // d*k, column-major: centroid[dim][clusterIdx]
     val offsets: IntArray,      // k+1 block offsets per cluster
     val labels: ByteArray,      // paddedN labels (0=legit, 1=fraud)
-    val blocks: ShortArray,     // totalBlocks * 112 i16s, column-major within block
+    val blocks: ByteBuffer,     // mmap'd: totalBlocks * 112 i16s LE, column-major within block
     val k: Int,
     val n: Int,
     val paddedN: Int,
@@ -40,9 +42,33 @@ object DataLoader {
             val labels = ByteArray(paddedN)
             dis.readFully(labels)
 
-            val blocks = readShortArrayLE(dis, totalBlocks * 112)
+            val blocks = mmapBlocks(dis, totalBlocks)
 
             return Dataset(centroids, offsets, labels, blocks, k, n, paddedN)
+        }
+    }
+
+    // Write raw LE bytes directly to a temp file and mmap READ_ONLY.
+    // The 80MB blocks array lives in the OS page cache instead of JVM heap;
+    // only the clusters actually probed (8-24 of 4096) stay resident.
+    private fun mmapBlocks(dis: DataInputStream, totalBlocks: Int): ByteBuffer {
+        val totalBytes = totalBlocks.toLong() * 112 * 2
+        val file = java.io.File("/tmp/rinha-blocks.bin")
+        val buf = ByteArray(65536)
+        java.io.FileOutputStream(file).use { fos ->
+            var remaining = totalBytes
+            while (remaining > 0) {
+                val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                dis.readFully(buf, 0, toRead)
+                fos.write(buf, 0, toRead)
+                remaining -= toRead
+            }
+        }
+        return java.io.RandomAccessFile(file, "r").use { raf ->
+            raf.channel.use { ch ->
+                ch.map(FileChannel.MapMode.READ_ONLY, 0, totalBytes)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            }
         }
     }
 }
@@ -84,23 +110,6 @@ private fun readFloatArrayLE(dis: DataInputStream, count: Int): FloatArray {
                 ((buf[b+2].toInt() and 0xFF) shl 16) or
                 ((buf[b+3].toInt() and 0xFF) shl 24)
             result[pos++] = java.lang.Float.intBitsToFloat(bits)
-        }
-        remaining -= toRead
-    }
-    return result
-}
-
-private fun readShortArrayLE(dis: DataInputStream, count: Int): ShortArray {
-    val result = ShortArray(count)
-    val buf = ByteArray(65536)
-    var pos = 0
-    var remaining = count * 2
-    while (remaining > 0) {
-        val toRead = minOf(buf.size, remaining)
-        dis.readFully(buf, 0, toRead)
-        val pairs = toRead / 2
-        for (i in 0 until pairs) {
-            result[pos++] = ((buf[i * 2].toInt() and 0xFF) or ((buf[i * 2 + 1].toInt() and 0xFF) shl 8)).toShort()
         }
         remaining -= toRead
     }
