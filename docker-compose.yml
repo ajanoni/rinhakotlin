@@ -15,7 +15,7 @@ services:
       resources:
         limits:
           cpus: "0.4"
-          memory: "160M"
+          memory: "170M"
     ulimits:
       nofile:
         soft: 65535
@@ -29,41 +29,23 @@ services:
       - SOCK=/run/sock/api2.sock
 
   lb:
-    image: ajanoni/rinha-fraud-2026-kotlin:latest
-    entrypoint:
-      - java
-      - --add-opens
-      - java.base/sun.nio.ch=ALL-UNNAMED
-      - --add-opens
-      - java.base/java.nio=ALL-UNNAMED
-      - -Xms16m
-      - -Xmx24m
-      - -XX:+UseG1GC
-      - -XX:MaxMetaspaceSize=16m
-      - -XX:ReservedCodeCacheSize=8m
-      - -Dio.netty.maxDirectMemory=4194304
-      - -cp
-      - /app.jar
-      - rinhakotlin.LoadBalancerKt
+    image: nginx:alpine
     restart: always
     depends_on:
       api1:
         condition: service_healthy
       api2:
         condition: service_healthy
-    environment:
-      - UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
-      - PORT=9999
-      - WORKERS=1
     ports:
       - "9999:9999"
     volumes:
       - sock:/run/sock
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     deploy:
       resources:
         limits:
           cpus: "0.2"
-          memory: "30M"
+          memory: "10M"
     ulimits:
       nofile:
         soft: 65535
@@ -73,3 +55,7 @@ services:
 
 volumes:
   sock:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
